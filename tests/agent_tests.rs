@@ -101,7 +101,7 @@ fn test_build_interactive_command_existing_agents_unchanged() {
     );
     assert_eq!(
         by_name("codex").build_interactive_command(""),
-        "codex --full-auto"
+        "codex --sandbox workspace-write"
     );
     assert_eq!(
         by_name("gemini").build_interactive_command(""),

@@ -363,7 +363,7 @@ Plugin defaults to the project's active plugin (set via `P` on the board).
 
 ### Agent Integration
 - Agents spawned via `build_interactive_command()` in `src/agent/mod.rs`
-- Each agent has its own flags: Claude (`--dangerously-skip-permissions`), Codex (`--full-auto`), Gemini (`--approval-mode yolo`), Copilot (`--allow-all-tools`)
+- Each agent has its own flags: Claude (`--dangerously-skip-permissions`), Codex (`--sandbox workspace-write`), Gemini (`--approval-mode yolo`), Copilot (`--allow-all-tools`)
 - Skills deployed to agent-native paths via `write_skills_to_worktree()` in app.rs
 - Commands resolved per-task via `resolve_skill_command()` (plugin command + agent transform)
 - Prompts resolved per-task via `resolve_prompt()` (pure template substitution, agent-agnostic)
