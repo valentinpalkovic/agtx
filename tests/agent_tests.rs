@@ -166,12 +166,28 @@ fn test_build_orchestrator_command_claude_is_idempotent() {
     let cmd = ops.build_orchestrator_command("{\"type\":\"stdio\"}", "/usr/bin/agtx");
 
     let pre_remove_idx = cmd
-        .find("claude mcp remove agtx")
+        .find("claude mcp remove agtx-orchestrator")
         .expect("pre-remove stale registration");
     let add_idx = cmd
-        .find("claude mcp add-json agtx")
+        .find("claude mcp add-json agtx-orchestrator")
         .expect("register MCP");
     assert!(pre_remove_idx < add_idx, "pre-remove must precede add-json:\n{cmd}");
+
+    // Must NOT register under the bare `agtx` name: that collides with an `agtx`
+    // server defined in another scope (plugin / user / .mcp.json) and makes
+    // Claude Code report a configuration conflict and refuse to connect.
+    assert!(
+        !cmd.contains("add-json agtx "),
+        "must register under a unique name, not bare `agtx`:\n{cmd}"
+    );
+
+    // The JSON's wrapping single quotes must be escaped (`'\''`) so the command
+    // survives create_window's outer `sh -c '...'` layer. A bare `'{json}'` would
+    // break out of that wrapper and mangle the JSON.
+    assert!(
+        cmd.contains(r"'\''"),
+        "JSON quotes must be escaped for the outer sh -c wrapper:\n{cmd}"
+    );
 
     let pre_section = &cmd[..add_idx];
     assert!(

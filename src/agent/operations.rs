@@ -91,13 +91,28 @@ impl AgentOperations for CodingAgent {
 
     fn build_orchestrator_command(&self, mcp_json: &str, _agtx_bin: &str) -> String {
         match self.agent.name.as_str() {
-            // Pre-remove any stale `agtx` registration (last run crashed before
-            // its own `mcp remove`) so `add-json` doesn't fail with "already
-            // exists" and short-circuit the `&&` into an empty shell.
+            // Register under a unique name (`agtx-orchestrator`) rather than
+            // `agtx` to avoid colliding with an `agtx` server already defined in
+            // another scope (the Claude Code plugin's `plugin:agtx:agtx`, a
+            // user-scope entry in ~/.claude.json, or the repo's .mcp.json).
+            // A same-named server across scopes with different endpoints makes
+            // Claude Code report a configuration conflict and refuse to connect.
+            //
+            // Pre-remove any stale registration (last run crashed before its own
+            // `mcp remove`) so `add-json` doesn't fail with "already exists" and
+            // short-circuit the `&&` into an empty shell.
+            //
+            // The JSON must be single-quoted for `add-json`, but this whole
+            // command is itself wrapped in `sh -c '...'` by create_window. A bare
+            // `'{json}'` would close that outer quote and let the shell mangle the
+            // JSON (yielding "Invalid configuration: Invalid input"). Escape the
+            // wrapping quotes as `'\''` (the POSIX single-quote-in-single-quote
+            // idiom, same convention build_interactive_command uses for prompts)
+            // so they survive the outer `sh -c` layer intact.
             "claude" => format!(
-                "claude mcp remove agtx --scope local 2>/dev/null || true; \
-                 claude mcp add-json agtx '{}' --scope local && {}; \
-                 claude mcp remove agtx --scope local",
+                "claude mcp remove agtx-orchestrator --scope local 2>/dev/null || true; \
+                 claude mcp add-json agtx-orchestrator '\\''{}'\\'' --scope local && {}; \
+                 claude mcp remove agtx-orchestrator --scope local",
                 mcp_json,
                 self.build_interactive_command("")
             ),
