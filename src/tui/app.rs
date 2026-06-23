@@ -5,7 +5,8 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{prelude::*, widgets::*};
-use std::collections::{HashMap, HashSet};
+use std::cell::Cell;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -49,7 +50,7 @@ fn build_footer_text(
                 " [j/k] navigate  [Enter] open  [l] board  [e] hide sidebar  [q] quit ".to_string()
             } else {
                 match selected_column {
-                    0 => " [o] new  [/] search  [Enter] open  [x] del  [d] diff  [R] research  [m] plan  [M] run  [e] sidebar  [q] quit".to_string(),
+                    0 => " [o] new  [/] search  [Enter] open  [x] del  [d] diff  [D] deps  [R] research  [m] plan  [M] run  [e] sidebar  [q] quit".to_string(),
                     1 => if fullscreen_on_enter {
                         " [o] new  [/] search  [Enter] open  [x] del  [d] diff  [m] run  [e] sidebar  [q] quit".to_string()
                     } else {
@@ -315,7 +316,29 @@ struct AppState {
     session_refresh_rx: Option<mpsc::Receiver<SessionRefreshResult>>,
     // Cache of dependency satisfaction per task ID (refreshed with tasks)
     deps_satisfied_cache: HashMap<String, bool>,
+    // Full-screen dependency-graph overlay (Shift+D)
+    dep_graph_popup: Option<DepGraphPopup>,
+    // Queue of task IDs awaiting serialized worktree setup (batch-move from the
+    // dependency view). Worktree setup runs one-at-a-time via `setup_rx`; this
+    // queue is drained as each setup completes.
+    setup_queue: VecDeque<String>,
     instance_id: String,
+}
+
+/// State for the dependency-graph overlay.
+struct DepGraphPopup {
+    graph: crate::tui::dep_graph::DepGraph,
+    /// Cursor index into `graph.nodes`.
+    selected: usize,
+    /// Task IDs marked for batch-move (only unblocked nodes are markable).
+    marked: HashSet<String>,
+    /// Horizontal scroll offset, in levels (columns), for wide graphs. Owned and
+    /// corrected by the draw pass each frame so the selected node stays on
+    /// screen; the key handler only moves `selected` and lets render re-clamp.
+    scroll_levels: Cell<usize>,
+    /// Number of level-columns that fit on screen, recorded by the last draw.
+    /// Used only for the footer hint. Starts at 1, corrected on first render.
+    visible_levels: Cell<usize>,
 }
 
 /// State for confirming move to Done
@@ -671,6 +694,8 @@ impl App {
                 orchestrator_last_check: Instant::now(),
                 session_refresh_rx: None,
                 deps_satisfied_cache: HashMap::new(),
+                dep_graph_popup: None,
+                setup_queue: VecDeque::new(),
                 instance_id: uuid::Uuid::new_v4().to_string(),
             },
         };
@@ -856,6 +881,8 @@ impl App {
                 orchestrator_last_check: Instant::now(),
                 session_refresh_rx: None,
                 deps_satisfied_cache: HashMap::new(),
+                dep_graph_popup: None,
+                setup_queue: VecDeque::new(),
                 instance_id: uuid::Uuid::new_v4().to_string(),
             },
         })
@@ -925,6 +952,8 @@ impl App {
                         }
                         self.refresh_tasks()?;
                     }
+                    // This setup finished; start the next queued batch task (if any).
+                    self.try_start_next_queued_setup()?;
                 }
             }
 
@@ -2218,6 +2247,238 @@ impl App {
             );
             frame.render_widget(footer, popup_chunks[2]);
         }
+
+        // Dependency-graph overlay
+        if let Some(ref popup) = state.dep_graph_popup {
+            Self::draw_dependency_graph(popup, frame, area, &state.config.theme);
+        }
+    }
+
+    /// Render the dependency-graph overlay: topological columns of task cards,
+    /// with unblocked Backlog tasks in green and marked tasks reversed.
+    fn draw_dependency_graph(
+        popup: &DepGraphPopup,
+        frame: &mut Frame,
+        area: Rect,
+        theme: &ThemeConfig,
+    ) {
+        let popup_area = centered_rect(90, 90, area);
+        frame.render_widget(Clear, popup_area);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // Title bar
+                Constraint::Min(0),    // Columns
+                Constraint::Length(1), // Footer
+            ])
+            .split(popup_area);
+
+        // Title bar.
+        let unblocked_count = popup.graph.nodes.iter().filter(|n| n.unblocked).count();
+        let title = format!(
+            " Dependency Graph — {} tasks, {} unblocked ",
+            popup.graph.nodes.len(),
+            unblocked_count
+        );
+        let title_bar = Paragraph::new(title).style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(hex_to_color(&theme.color_popup_header)),
+        );
+        frame.render_widget(title_bar, chunks[0]);
+
+        let body = chunks[1];
+        let level_count = popup.graph.level_count();
+        if level_count == 0 {
+            let empty = Paragraph::new("No tasks").block(
+                Block::default().borders(Borders::ALL).border_style(
+                    Style::default().fg(hex_to_color(&theme.color_popup_border)),
+                ),
+            );
+            frame.render_widget(empty, body);
+        } else {
+            // Fit as many columns as possible at a fixed minimum width, starting
+            // from the horizontal scroll offset.
+            const COL_WIDTH: u16 = 26;
+            let max_visible = (body.width / COL_WIDTH).max(1) as usize;
+            // Record the viewport width so the key handler can keep the cursor in
+            // view when scrolling horizontally.
+            popup.visible_levels.set(max_visible);
+            // Honor the stored offset, but always keep the selected node's level
+            // on screen — covers the initial open (cursor may start in a far
+            // level) and every navigation (the key handler just moves the cursor
+            // and lets this clamp re-scroll).
+            let sel_level = popup
+                .graph
+                .nodes
+                .get(popup.selected)
+                .map_or(0, |n| n.level);
+            let start = clamp_scroll_to_selected(
+                popup.scroll_levels.get(),
+                sel_level,
+                max_visible,
+                level_count,
+            );
+            // Persist the corrected offset so the footer hint stays in sync.
+            popup.scroll_levels.set(start);
+            let visible_cols = max_visible.min(level_count - start);
+            let end = (start + visible_cols).min(level_count);
+
+            let col_constraints: Vec<Constraint> = (start..end)
+                .map(|_| Constraint::Ratio(1, (end - start) as u32))
+                .collect();
+            let col_areas = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints(col_constraints)
+                .split(body);
+
+            for (slot, level) in (start..end).enumerate() {
+                let col_area = col_areas[slot];
+                Self::draw_dep_level_column(popup, frame, col_area, level, theme);
+            }
+        }
+
+        // Footer.
+        let scroll_hint = if level_count > 0 {
+            let scroll = popup.scroll_levels.get();
+            let first = scroll + 1;
+            let last = (scroll + popup.visible_levels.get()).min(level_count);
+            format!(" cols {first}-{last}/{level_count} ")
+        } else {
+            String::new()
+        };
+        let footer_text = format!(
+            " [hjkl] move  [Space] mark  [a] all unblocked  [c] clear  [Enter] move {} →research  [q] close {}",
+            popup.marked.len(),
+            scroll_hint
+        );
+        let footer = Paragraph::new(footer_text).style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(hex_to_color(&theme.color_dimmed)),
+        );
+        frame.render_widget(footer, chunks[2]);
+    }
+
+    /// Render a single topological column (level) of the dependency graph.
+    fn draw_dep_level_column(
+        popup: &DepGraphPopup,
+        frame: &mut Frame,
+        area: Rect,
+        level: usize,
+        theme: &ThemeConfig,
+    ) {
+        let Some(indices) = popup.graph.levels.get(level) else {
+            return;
+        };
+
+        // Column header.
+        let header = Paragraph::new(format!("Level {level}"))
+            .style(
+                Style::default()
+                    .fg(hex_to_color(&theme.color_column_header))
+                    .bold(),
+            )
+            .alignment(Alignment::Center);
+        let header_area = Rect { height: 1, ..area };
+        frame.render_widget(header, header_area);
+
+        // Each card is 4 rows tall (border + title + status + hint).
+        const CARD_HEIGHT: u16 = 4;
+        let mut y = area.y + 1;
+        for &idx in indices {
+            if y + CARD_HEIGHT > area.y + area.height {
+                break;
+            }
+            let Some(node) = popup.graph.nodes.get(idx) else {
+                continue;
+            };
+            let card_area = Rect {
+                x: area.x,
+                y,
+                width: area.width,
+                height: CARD_HEIGHT,
+            };
+            let is_cursor = idx == popup.selected;
+            let is_marked = popup.marked.contains(&node.task_id);
+
+            // Choose the node color by status / unblocked state.
+            let base_color = if node.unblocked {
+                Color::Green
+            } else if matches!(node.status, TaskStatus::Done) {
+                hex_to_color(&theme.color_dimmed)
+            } else if matches!(node.status, TaskStatus::Backlog) {
+                // Blocked Backlog (deps not satisfied).
+                hex_to_color(&theme.color_dimmed)
+            } else {
+                hex_to_color(&theme.color_normal)
+            };
+
+            let border_style = if is_cursor {
+                Style::default().fg(hex_to_color(&theme.color_selected))
+            } else {
+                Style::default().fg(base_color)
+            };
+            let border_type = if is_cursor {
+                BorderType::Thick
+            } else {
+                BorderType::Plain
+            };
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(border_style)
+                .border_type(border_type);
+            let inner = block.inner(card_area);
+            frame.render_widget(block, card_area);
+
+            // Marker glyph: ✓ done, ⊘ blocked Backlog, ● unblocked, else space.
+            let marker = if node.unblocked {
+                "\u{25cf} " // ●
+            } else if matches!(node.status, TaskStatus::Done) {
+                "\u{2713} " // ✓
+            } else if matches!(node.status, TaskStatus::Backlog) {
+                "\u{2298} " // ⊘ blocked
+            } else {
+                "  "
+            };
+
+            let mut title_style = Style::default().fg(base_color);
+            if is_marked {
+                title_style = title_style.add_modifier(Modifier::REVERSED).bold();
+            } else if is_cursor {
+                title_style = title_style.bold();
+            }
+
+            // Title line (marker + truncated title).
+            let title_text = truncate_str(&node.title, inner.width.saturating_sub(2) as usize);
+            let title_line = Line::from(vec![
+                Span::styled(marker, title_style),
+                Span::styled(title_text, title_style),
+            ]);
+            // Status line.
+            let status_line = Line::from(Span::styled(
+                format!("[{}]", node.status.as_str()),
+                Style::default().fg(hex_to_color(&theme.color_description)),
+            ));
+            // Dependency hint line.
+            let hint = if node.dep_titles.is_empty() {
+                String::new()
+            } else {
+                let joined = node.dep_titles.join(", ");
+                format!("\u{2190} {}", truncate_str(&joined, inner.width.saturating_sub(2) as usize))
+            };
+            let hint_line = Line::from(Span::styled(
+                hint,
+                Style::default().fg(hex_to_color(&theme.color_dimmed)),
+            ));
+
+            let para = Paragraph::new(vec![title_line, status_line, hint_line]);
+            frame.render_widget(para, inner);
+
+            y += CARD_HEIGHT;
+        }
     }
 
     fn draw_shell_popup(popup: &ShellPopup, frame: &mut Frame, area: Rect, theme: &ThemeConfig) {
@@ -2615,6 +2876,11 @@ impl App {
         // Handle diff popup if open
         if self.state.diff_popup.is_some() {
             return self.handle_diff_popup_key(key);
+        }
+
+        // Handle dependency-graph overlay if open
+        if self.state.dep_graph_popup.is_some() {
+            return self.handle_dep_graph_key(key);
         }
 
         // Handle PR confirmation popup if open
@@ -3539,6 +3805,7 @@ impl App {
             }
             KeyCode::Char('x') => self.delete_selected_task()?,
             KeyCode::Char('d') => self.show_task_diff()?,
+            KeyCode::Char('D') => self.show_dependency_graph()?,
             KeyCode::Char('m') => self.move_task_right()?,
             KeyCode::Char('M') => self.move_backlog_to_running()?,
             KeyCode::Char('R') => {
@@ -5115,6 +5382,233 @@ impl App {
             }
         });
 
+        Ok(())
+    }
+
+    /// Build and open the dependency-graph overlay for the current project's tasks.
+    fn show_dependency_graph(&mut self) -> Result<()> {
+        let Some(db) = self.state.db.as_ref() else {
+            return Ok(());
+        };
+        let tasks = db.get_all_tasks().unwrap_or_default();
+        if tasks.is_empty() {
+            self.state.warning_message =
+                Some(("No tasks to show in the dependency view".to_string(), Instant::now()));
+            return Ok(());
+        }
+        let graph = crate::tui::dep_graph::build_dep_graph(&tasks, |t| db.deps_satisfied(t));
+        // Start the cursor on the first unblocked node if there is one.
+        let selected = graph
+            .nodes
+            .iter()
+            .position(|n| n.unblocked)
+            .unwrap_or(0);
+        self.state.dep_graph_popup = Some(DepGraphPopup {
+            graph,
+            selected,
+            marked: HashSet::new(),
+            scroll_levels: Cell::new(0),
+            visible_levels: Cell::new(1),
+        });
+        Ok(())
+    }
+
+    /// Key handling for the dependency-graph overlay.
+    fn handle_dep_graph_key(&mut self, key: crossterm::event::KeyEvent) -> Result<()> {
+        let Some(popup) = self.state.dep_graph_popup.as_mut() else {
+            return Ok(());
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.state.dep_graph_popup = None;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                Self::dep_graph_move_vertical(popup, 1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                Self::dep_graph_move_vertical(popup, -1);
+            }
+            KeyCode::Char('l') | KeyCode::Right => {
+                Self::dep_graph_move_horizontal(popup, 1);
+            }
+            KeyCode::Char('h') | KeyCode::Left => {
+                Self::dep_graph_move_horizontal(popup, -1);
+            }
+            KeyCode::Char(' ') => {
+                // Toggle mark on the selected node, only if it is unblocked.
+                if let Some(node) = popup.graph.nodes.get(popup.selected) {
+                    if node.unblocked {
+                        let id = node.task_id.clone();
+                        if !popup.marked.remove(&id) {
+                            popup.marked.insert(id);
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('a') => {
+                // Mark all unblocked nodes.
+                for id in popup.graph.unblocked_ids() {
+                    popup.marked.insert(id);
+                }
+            }
+            KeyCode::Char('c') => {
+                popup.marked.clear();
+            }
+            KeyCode::Enter => {
+                // Collect targets: marked nodes, or the selected node if nothing
+                // is marked and it is unblocked.
+                let mut targets: Vec<String> = popup
+                    .graph
+                    .nodes
+                    .iter()
+                    .filter(|n| n.unblocked && popup.marked.contains(&n.task_id))
+                    .map(|n| n.task_id.clone())
+                    .collect();
+                if targets.is_empty() {
+                    if let Some(node) = popup.graph.nodes.get(popup.selected) {
+                        if node.unblocked {
+                            targets.push(node.task_id.clone());
+                        }
+                    }
+                }
+                if targets.is_empty() {
+                    self.state.warning_message = Some((
+                        "No unblocked tasks selected — press Space to mark one".to_string(),
+                        Instant::now(),
+                    ));
+                    return Ok(());
+                }
+                self.state.dep_graph_popup = None;
+                self.batch_move_unblocked(targets)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Move the cursor up/down within the current level (column).
+    fn dep_graph_move_vertical(popup: &mut DepGraphPopup, delta: i32) {
+        let Some(node) = popup.graph.nodes.get(popup.selected) else {
+            return;
+        };
+        let level = node.level;
+        let Some(col) = popup.graph.levels.get(level) else {
+            return;
+        };
+        let pos = col.iter().position(|&i| i == popup.selected).unwrap_or(0);
+        let new_pos = (pos as i32 + delta).clamp(0, col.len() as i32 - 1) as usize;
+        if let Some(&idx) = col.get(new_pos) {
+            popup.selected = idx;
+        }
+    }
+
+    /// Move the cursor left/right across levels, keeping a similar row position.
+    fn dep_graph_move_horizontal(popup: &mut DepGraphPopup, delta: i32) {
+        let Some(node) = popup.graph.nodes.get(popup.selected) else {
+            return;
+        };
+        let level = node.level;
+        let cur_pos = popup
+            .graph
+            .levels
+            .get(level)
+            .and_then(|col| col.iter().position(|&i| i == popup.selected))
+            .unwrap_or(0);
+        let new_level = (level as i32 + delta).clamp(0, popup.graph.level_count() as i32 - 1);
+        if new_level < 0 {
+            return;
+        }
+        let new_level = new_level as usize;
+        if let Some(col) = popup.graph.levels.get(new_level) {
+            if !col.is_empty() {
+                let new_pos = cur_pos.min(col.len() - 1);
+                popup.selected = col[new_pos];
+            }
+        }
+        // Scrolling is handled by the draw pass, which re-clamps `scroll_levels`
+        // each frame to keep the selected node on screen.
+    }
+
+    /// Enqueue unblocked tasks for serialized worktree setup, then kick off the first.
+    fn batch_move_unblocked(&mut self, task_ids: Vec<String>) -> Result<()> {
+        for id in task_ids {
+            if !self.state.setup_queue.contains(&id) {
+                self.state.setup_queue.push_back(id);
+            }
+        }
+        self.try_start_next_queued_setup()
+    }
+
+    /// If no worktree setup is currently running, start the next queued batch task.
+    /// Routes each task to research when its plugin supports it, else to planning.
+    fn try_start_next_queued_setup(&mut self) -> Result<()> {
+        // A setup is in progress — it will call back here when it completes.
+        if self.state.setup_rx.is_some() {
+            return Ok(());
+        }
+        while let Some(task_id) = self.state.setup_queue.pop_front() {
+            // Re-validate: the task may have changed status or deps since queuing.
+            let Some(db) = self.state.db.as_ref() else {
+                continue;
+            };
+            let Some(task) = db.get_task(&task_id).ok().flatten() else {
+                continue;
+            };
+            if task.status != TaskStatus::Backlog || !db.deps_satisfied(&task) {
+                continue;
+            }
+
+            // Prefer research if the plugin defines a research/preresearch command.
+            let plugin = self.load_task_plugin(&task);
+            let has_research_cmd = plugin.as_ref().map_or(false, |p| {
+                p.commands.research.is_some() || p.commands.preresearch.is_some()
+            });
+
+            if has_research_cmd {
+                self.start_research(&task_id)?;
+            } else {
+                self.start_planning_from_backlog(&task_id)?;
+            }
+
+            // start_research / start_planning_from_backlog set setup_rx when they
+            // spawn a background setup. If so, stop draining — the completion
+            // handler will resume the queue. If not (no-op), keep draining.
+            if self.state.setup_rx.is_some() {
+                break;
+            }
+        }
+        self.refresh_tasks()?;
+        Ok(())
+    }
+
+    /// Move a Backlog task into Planning (the planning fallback for plugins with
+    /// no research phase). Mirrors `move_task_right`'s Backlog→Planning branch.
+    fn start_planning_from_backlog(&mut self, task_id: &str) -> Result<()> {
+        if self.state.setup_rx.is_some() {
+            return Ok(());
+        }
+        let (mut task, project_path) = match (
+            self.state.db.as_ref().and_then(|db| db.get_task(task_id).ok().flatten()),
+            self.state.project_path.clone(),
+        ) {
+            (Some(t), Some(p)) => (t, p),
+            _ => return Ok(()),
+        };
+        if task.status != TaskStatus::Backlog {
+            return Ok(());
+        }
+        let handled = self.transition_to_planning(&mut task, &project_path)?;
+        if !handled {
+            task.status = TaskStatus::Planning;
+            task.updated_at = chrono::Utc::now();
+            task.escalation_note = None;
+            if let Some(db) = &self.state.db {
+                db.update_task(&task)?;
+            }
+            self.state.stuck_task_notified.remove(&task.id);
+            self.state.stuck_task_idle_since.remove(&task.id);
+            self.state.phase_status_cache.remove(&task.id);
+        }
         Ok(())
     }
 
@@ -7209,6 +7703,49 @@ fn collect_task_diff(
 }
 
 /// Helper function to create a centered rect
+/// Clamp a horizontal scroll offset (in level-columns) so the selected level is
+/// visible within a viewport `visible` columns wide. Returns the new offset.
+///
+/// - If the selection is left of the window, scroll left to it.
+/// - If it is at/past the right edge, scroll right so it sits on the last
+///   visible column.
+/// - The offset never exceeds what keeps the last column flush with the right
+///   edge (no blank trailing space when the graph is wider than the viewport).
+fn clamp_scroll_to_selected(
+    scroll: usize,
+    sel_level: usize,
+    visible: usize,
+    level_count: usize,
+) -> usize {
+    let visible = visible.max(1);
+    let mut start = scroll.min(level_count.saturating_sub(1));
+    if sel_level < start {
+        start = sel_level;
+    } else if sel_level >= start + visible {
+        start = sel_level + 1 - visible;
+    }
+    // Don't scroll past the point where the final column is at the right edge.
+    let max_start = level_count.saturating_sub(visible);
+    start.min(max_start)
+}
+
+/// Truncate a string to at most `max` characters, appending an ellipsis when
+/// it was shortened. Operates on chars so it is UTF-8 safe.
+fn truncate_str(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let char_count = s.chars().count();
+    if char_count <= max {
+        return s.to_string();
+    }
+    if max == 1 {
+        return "\u{2026}".to_string();
+    }
+    let taken: String = s.chars().take(max - 1).collect();
+    format!("{taken}\u{2026}")
+}
+
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)

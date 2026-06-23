@@ -10290,3 +10290,51 @@ fn test_switch_to_project_reloads_config() {
     // Config should now reflect the new project's settings
     assert_eq!(app.state.config.agent_for_phase("review"), "codex");
 }
+
+// === Dependency-graph horizontal scroll clamp ===
+
+#[test]
+fn dep_scroll_no_change_when_selection_already_visible() {
+    // 10 levels, viewport shows 4, scroll at 0, selection at level 2 -> stays.
+    assert_eq!(clamp_scroll_to_selected(0, 2, 4, 10), 0);
+}
+
+#[test]
+fn dep_scroll_right_when_selection_past_right_edge() {
+    // Viewport [0,4): selecting level 4 must scroll so 4 is the last visible col.
+    assert_eq!(clamp_scroll_to_selected(0, 4, 4, 10), 1);
+    // Selecting level 6 from scroll 0 -> start = 6 + 1 - 4 = 3.
+    assert_eq!(clamp_scroll_to_selected(0, 6, 4, 10), 3);
+}
+
+#[test]
+fn dep_scroll_left_when_selection_before_left_edge() {
+    // Window starts at 5, selecting level 2 -> scroll left to 2.
+    assert_eq!(clamp_scroll_to_selected(5, 2, 4, 10), 2);
+}
+
+#[test]
+fn dep_scroll_reaches_last_level() {
+    // The final level (9) must become visible: start = 9 + 1 - 4 = 6.
+    assert_eq!(clamp_scroll_to_selected(0, 9, 4, 10), 6);
+}
+
+#[test]
+fn dep_scroll_never_overshoots_past_end() {
+    // A stale large scroll is clamped so the last column stays flush right.
+    // max_start = level_count - visible = 10 - 4 = 6.
+    assert_eq!(clamp_scroll_to_selected(99, 9, 4, 10), 6);
+}
+
+#[test]
+fn dep_scroll_handles_fewer_levels_than_viewport() {
+    // 3 levels, viewport fits 5 -> never scrolls; offset stays 0.
+    assert_eq!(clamp_scroll_to_selected(0, 2, 5, 3), 0);
+    assert_eq!(clamp_scroll_to_selected(2, 0, 5, 3), 0);
+}
+
+#[test]
+fn dep_scroll_zero_visible_treated_as_one() {
+    // Defensive: a zero viewport width must not panic (treated as 1 column).
+    assert_eq!(clamp_scroll_to_selected(0, 5, 0, 10), 5);
+}

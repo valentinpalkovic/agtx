@@ -558,3 +558,85 @@ fn test_global_db_file_permissions_are_0600() {
         assert_eq!(mode, 0o600, "Global DB file should be owner-only read/write");
     }
 }
+
+// === Dependency-graph integration tests (real Database + deps_satisfied) ===
+
+use agtx::tui::dep_graph::build_dep_graph;
+
+/// Build a dependency graph from a real in-memory database, exercising the
+/// same `deps_satisfied` rule the board uses. This complements the pure-model
+/// unit tests in src/tui/dep_graph.rs.
+#[test]
+fn test_dep_graph_levels_and_unblocked_from_db() {
+    let db = Database::open_in_memory_project().unwrap();
+
+    // Level 0: a completed dependency.
+    let mut base = Task::new("Base", "claude", "proj");
+    base.status = TaskStatus::Done;
+    db.create_task(&base).unwrap();
+
+    // Level 1: a Backlog task whose only dep (base) is Done -> unblocked.
+    let mut api = Task::new("API", "claude", "proj");
+    api.referenced_tasks = Some(base.id.clone());
+    db.create_task(&api).unwrap();
+
+    // Level 2: a Backlog task depending on API (still Backlog) -> blocked.
+    let mut ui = Task::new("UI", "claude", "proj");
+    ui.referenced_tasks = Some(api.id.clone());
+    db.create_task(&ui).unwrap();
+
+    let tasks = db.get_all_tasks().unwrap();
+    let graph = build_dep_graph(&tasks, |t| db.deps_satisfied(t));
+
+    let node = |id: &str| {
+        graph
+            .nodes
+            .iter()
+            .find(|n| n.task_id == id)
+            .expect("node present")
+    };
+
+    // Topological columns.
+    assert_eq!(node(&base.id).level, 0);
+    assert_eq!(node(&api.id).level, 1);
+    assert_eq!(node(&ui.id).level, 2);
+
+    // Only API is an actionable (unblocked) Backlog task: its dep is Done.
+    assert!(node(&api.id).unblocked);
+    // UI's dep (API) is still in Backlog, so UI is blocked.
+    assert!(!node(&ui.id).unblocked);
+    // Base is Done, so it is not "unblocked" (not actionable).
+    assert!(!node(&base.id).unblocked);
+
+    let unblocked = graph.unblocked_ids();
+    assert_eq!(unblocked, vec![api.id.clone()]);
+}
+
+#[test]
+fn test_dep_graph_unblocks_chain_as_deps_complete() {
+    let db = Database::open_in_memory_project().unwrap();
+
+    // a (Backlog) -> b (Backlog): b depends on a.
+    let a = Task::new("A", "claude", "proj");
+    db.create_task(&a).unwrap();
+    let mut b = Task::new("B", "claude", "proj");
+    b.referenced_tasks = Some(a.id.clone());
+    db.create_task(&b).unwrap();
+
+    // Initially only A is unblocked (no deps); B is blocked on A.
+    let tasks = db.get_all_tasks().unwrap();
+    let graph = build_dep_graph(&tasks, |t| db.deps_satisfied(t));
+    let mut unblocked = graph.unblocked_ids();
+    unblocked.sort();
+    assert_eq!(unblocked, vec![a.id.clone()]);
+
+    // Complete A (move to Review). Now B should become unblocked.
+    let mut a_done = db.get_task(&a.id).unwrap().unwrap();
+    a_done.status = TaskStatus::Review;
+    db.update_task(&a_done).unwrap();
+
+    let tasks = db.get_all_tasks().unwrap();
+    let graph = build_dep_graph(&tasks, |t| db.deps_satisfied(t));
+    // A is no longer Backlog, so it drops out of the unblocked set; B enters it.
+    assert_eq!(graph.unblocked_ids(), vec![b.id.clone()]);
+}
