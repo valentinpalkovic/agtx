@@ -4,6 +4,7 @@ pub mod db;
 pub mod git;
 pub mod mcp;
 pub mod skills;
+pub mod telegram;
 pub mod tmux;
 pub mod tui;
 

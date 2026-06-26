@@ -323,6 +323,10 @@ struct AppState {
     // queue is drained as each setup completes.
     setup_queue: VecDeque<String>,
     instance_id: String,
+    // Telegram bridge: channel to request outbound idle-question checks (None when disabled)
+    telegram_tx: Option<mpsc::Sender<crate::telegram::OutboundCheck>>,
+    // Guard: task IDs already notified to Telegram for the current idle episode
+    telegram_idle_notified: HashSet<String>,
 }
 
 /// State for the dependency-graph overlay.
@@ -697,6 +701,8 @@ impl App {
                 dep_graph_popup: None,
                 setup_queue: VecDeque::new(),
                 instance_id: uuid::Uuid::new_v4().to_string(),
+                telegram_tx: None,
+                telegram_idle_notified: HashSet::new(),
             },
         };
 
@@ -884,11 +890,16 @@ impl App {
                 dep_graph_popup: None,
                 setup_queue: VecDeque::new(),
                 instance_id: uuid::Uuid::new_v4().to_string(),
+                telegram_tx: None,
+                telegram_idle_notified: HashSet::new(),
             },
         })
     }
 
     pub async fn run(&mut self) -> Result<()> {
+        // Start the Telegram bridge once if configured.
+        self.maybe_spawn_telegram_bridge();
+
         while !self.state.should_quit {
             self.draw()?;
 
@@ -4738,6 +4749,7 @@ impl App {
                 // Clear stale phase context
                 self.state.stuck_task_notified.remove(&task.id);
                 self.state.stuck_task_idle_since.remove(&task.id);
+                self.state.telegram_idle_notified.remove(&task.id);
                 self.state.phase_status_cache.remove(&task.id);
             }
         }
@@ -6930,6 +6942,14 @@ impl App {
                 .phase_status_cache
                 .insert(task_status.task_id.clone(), (phase, now));
 
+            // Telegram: re-arm the one-shot guard once a task leaves Idle (new output on
+            // screen may represent a fresh question for the next idle episode).
+            if phase != PhaseStatus::Idle {
+                self.state
+                    .telegram_idle_notified
+                    .remove(&task_status.task_id);
+            }
+
             // Notify orchestrator when a phase completes (newly Ready)
             if newly_ready {
                 if self.state.orchestrator_session.is_some() {
@@ -7080,9 +7100,75 @@ impl App {
                     .stuck_task_idle_since
                     .remove(&task_status.task_id);
             }
+
+            // Telegram bridge: push a notification when a task awaiting input goes idle.
+            // Works for Planning/Running/Review (the bridge injects answers via tmux directly,
+            // so it isn't bound by the MCP send_to_task Planning/Running restriction). The
+            // bridge thread decides whether the agent is actually asking; we just signal idle.
+            if let Some(tx) = &self.state.telegram_tx {
+                let eligible = matches!(
+                    task_status.status,
+                    TaskStatus::Planning | TaskStatus::Running | TaskStatus::Review
+                );
+                if eligible
+                    && phase == PhaseStatus::Idle
+                    && !self
+                        .state
+                        .telegram_idle_notified
+                        .contains(&task_status.task_id)
+                {
+                    if let Some(sn) = &task_status.session_name {
+                        self.state
+                            .telegram_idle_notified
+                            .insert(task_status.task_id.clone());
+                        let title = self
+                            .state
+                            .board
+                            .tasks
+                            .iter()
+                            .find(|t| t.id == task_status.task_id)
+                            .map(|t| t.title.clone())
+                            .unwrap_or_else(|| "task".to_string());
+                        let _ = tx.send(crate::telegram::OutboundCheck {
+                            task_id: task_status.task_id.clone(),
+                            session_name: sn.clone(),
+                            title,
+                            phase: task_status.status.as_str().to_string(),
+                            agent: task_status.agent.clone(),
+                        });
+                    }
+                }
+            }
         }
 
         self.state.spinner_frame = self.state.spinner_frame.wrapping_add(1);
+    }
+
+    /// Spawn the Telegram bridge thread once, if enabled and configured. Idempotent — a
+    /// no-op when already running, when the bridge is disabled, or in dashboard mode (no
+    /// project path to bind to).
+    fn maybe_spawn_telegram_bridge(&mut self) {
+        if self.state.telegram_tx.is_some() {
+            return;
+        }
+        let tg = &self.state.config.telegram;
+        if !tg.is_active() {
+            return;
+        }
+        let Some(project_path) = self.state.project_path.clone() else {
+            return;
+        };
+        let Some(token) = tg.resolved_token() else {
+            return;
+        };
+        let tx = crate::telegram::spawn(
+            token,
+            tg.allowed_chat_ids.clone(),
+            tg.poll_timeout_secs,
+            project_path,
+            Arc::clone(&self.state.tmux_ops),
+        );
+        self.state.telegram_tx = Some(tx);
     }
 
     fn switch_to_project(&mut self, project: &ProjectInfo) -> Result<()> {

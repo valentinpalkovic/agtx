@@ -24,6 +24,10 @@ pub struct GlobalConfig {
     /// Whether to automatically fullscreen-attach to the tmux session when opening a task popup
     #[serde(default)]
     pub fullscreen_on_enter: bool,
+
+    /// Telegram bridge: notify on idle agent questions and answer/control from your phone
+    #[serde(default)]
+    pub telegram: TelegramConfig,
 }
 
 impl Default for GlobalConfig {
@@ -34,7 +38,76 @@ impl Default for GlobalConfig {
             worktree: WorktreeConfig::default(),
             theme: ThemeConfig::default(),
             fullscreen_on_enter: false,
+            telegram: TelegramConfig::default(),
         }
+    }
+}
+
+/// Telegram bridge configuration.
+///
+/// When enabled, agtx pushes a Telegram message whenever a task's agent goes idle
+/// waiting for input, and accepts replies/commands to answer prompts, view the board,
+/// and advance tickets from your phone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelegramConfig {
+    /// Master switch for the bridge.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Bot token from @BotFather. Prefer the `AGTX_TELEGRAM_BOT_TOKEN` env var over
+    /// storing the token in plaintext here.
+    #[serde(default)]
+    pub bot_token: String,
+
+    /// Chat IDs allowed to control the bridge. **Empty rejects all inbound** (fail-closed).
+    #[serde(default)]
+    pub allowed_chat_ids: Vec<i64>,
+
+    /// Long-poll timeout for getUpdates, in seconds (also bounds outbound notification latency).
+    #[serde(default = "default_telegram_poll_timeout")]
+    pub poll_timeout_secs: u64,
+}
+
+impl Default for TelegramConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bot_token: String::new(),
+            allowed_chat_ids: Vec::new(),
+            poll_timeout_secs: default_telegram_poll_timeout(),
+        }
+    }
+}
+
+fn default_telegram_poll_timeout() -> u64 {
+    2
+}
+
+impl TelegramConfig {
+    /// Resolve the bot token, preferring the `AGTX_TELEGRAM_BOT_TOKEN` env var over config.
+    pub fn resolved_token(&self) -> Option<String> {
+        if let Ok(tok) = std::env::var("AGTX_TELEGRAM_BOT_TOKEN") {
+            let tok = tok.trim().to_string();
+            if !tok.is_empty() {
+                return Some(tok);
+            }
+        }
+        let tok = self.bot_token.trim();
+        if tok.is_empty() {
+            None
+        } else {
+            Some(tok.to_string())
+        }
+    }
+
+    /// True if the bridge should run (enabled and a token is available).
+    pub fn is_active(&self) -> bool {
+        self.enabled && self.resolved_token().is_some()
+    }
+
+    /// Fail-closed authorization: an empty allowlist rejects everyone.
+    pub fn is_authorized(&self, chat_id: i64) -> bool {
+        !self.allowed_chat_ids.is_empty() && self.allowed_chat_ids.contains(&chat_id)
     }
 }
 
@@ -363,6 +436,7 @@ pub struct MergedConfig {
     pub workflow_plugin: Option<String>,
     pub fullscreen_on_enter: bool,
     pub branch_prefix: String,
+    pub telegram: TelegramConfig,
 }
 
 impl MergedConfig {
@@ -401,6 +475,7 @@ impl MergedConfig {
                 .branch_prefix
                 .clone()
                 .unwrap_or_else(|| global.worktree.branch_prefix.clone()),
+            telegram: global.telegram.clone(),
         }
     }
 
