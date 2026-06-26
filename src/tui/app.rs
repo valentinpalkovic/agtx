@@ -327,6 +327,9 @@ struct AppState {
     telegram_tx: Option<mpsc::Sender<crate::telegram::OutboundCheck>>,
     // Guard: task IDs already notified to Telegram for the current idle episode
     telegram_idle_notified: HashSet<String>,
+    // When the board was last reloaded from the DB, so externally-created tasks
+    // (Telegram /new, MCP create_task) appear without restarting agtx.
+    last_board_refresh: Instant,
 }
 
 /// State for the dependency-graph overlay.
@@ -703,6 +706,7 @@ impl App {
                 instance_id: uuid::Uuid::new_v4().to_string(),
                 telegram_tx: None,
                 telegram_idle_notified: HashSet::new(),
+                last_board_refresh: Instant::now(),
             },
         };
 
@@ -892,6 +896,7 @@ impl App {
                 instance_id: uuid::Uuid::new_v4().to_string(),
                 telegram_tx: None,
                 telegram_idle_notified: HashSet::new(),
+                last_board_refresh: Instant::now(),
             },
         })
     }
@@ -1008,6 +1013,13 @@ impl App {
             }
             // Spawn background refresh if not already running and cache expired
             self.maybe_spawn_session_refresh();
+
+            // Periodically reload the board so tasks created by external writers
+            // (Telegram /new, MCP create_task) appear without restarting agtx.
+            if self.state.last_board_refresh.elapsed() >= std::time::Duration::from_secs(2) {
+                self.state.last_board_refresh = Instant::now();
+                let _ = self.refresh_tasks();
+            }
 
             // Deliver queued notifications to orchestrator when idle
             self.deliver_orchestrator_notifications();
