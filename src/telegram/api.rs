@@ -93,6 +93,25 @@ impl TelegramApi {
             .ok_or_else(|| anyhow!("sendMessage: missing message_id"))
     }
 
+    /// Replace a message's text and remove its inline keyboard (no reply_markup => cleared).
+    pub fn edit_message_text(&self, chat_id: i64, message_id: i64, text: &str) -> Result<()> {
+        let body = json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "disable_web_page_preview": true,
+        });
+        self.call("editMessageText", body)?;
+        Ok(())
+    }
+
+    /// Delete a previously sent message.
+    pub fn delete_message(&self, chat_id: i64, message_id: i64) -> Result<()> {
+        let body = json!({ "chat_id": chat_id, "message_id": message_id });
+        self.call("deleteMessage", body)?;
+        Ok(())
+    }
+
     /// Acknowledge a callback query (stops the spinner on the tapped button).
     pub fn answer_callback_query(&self, callback_query_id: &str, text: Option<&str>) -> Result<()> {
         let mut body = json!({ "callback_query_id": callback_query_id });

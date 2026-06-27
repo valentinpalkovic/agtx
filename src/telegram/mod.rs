@@ -52,9 +52,12 @@ struct CallbackData {
 
 /// Tracks an outbound question so a reply can be routed back to the right task.
 struct RouteEntry {
-    task_id: String,
     session_name: String,
     pane_hash: u64,
+    /// Chat the question was sent to (needed to edit/delete the message).
+    chat_id: i64,
+    /// Original message text, so we can append the answer when it's resolved.
+    text: String,
 }
 
 /// A queued transition we're waiting on so we can report the outcome back to Telegram.
@@ -207,6 +210,9 @@ fn run_bridge(
                 bridge.send_orch_pane(chat_id);
             }
         }
+
+        // 5. Delete question messages whose pane moved on (answered in the terminal).
+        bridge.prune_stale_routes();
     }
 }
 
@@ -279,9 +285,10 @@ impl Bridge {
                     self.routes.insert(
                         message_id,
                         RouteEntry {
-                            task_id: check.task_id.clone(),
                             session_name: check.session_name.clone(),
                             pane_hash,
+                            chat_id,
+                            text: text.clone(),
                         },
                     );
                 }
@@ -418,9 +425,14 @@ impl Bridge {
                 self.inject_keys(&session, &data.k, &data.p);
                 let _ = self
                     .api
-                    .answer_callback_query(cb_id, Some(&format!("Sent: {}", data.p)));
+                    .answer_callback_query(cb_id, Some("✅ Answer sent"));
+                // Persist the answer in the message and remove the buttons so it reads as
+                // handled and can't be re-tapped.
                 if let Some(mid) = message_id {
-                    self.routes.remove(&mid);
+                    if let Some(route) = self.routes.remove(&mid) {
+                        let edited = format!("{}\n\n✅ You answered: {}", route.text, data.p);
+                        let _ = self.api.edit_message_text(route.chat_id, mid, &edited);
+                    }
                 }
             }
             _ => {
@@ -462,19 +474,22 @@ impl Bridge {
     }
 
     fn handle_free_text(&mut self, chat_id: i64, text: &str, reply_to: Option<i64>) {
-        // Resolve the target task: reply-to route > active task pointer.
-        let target: Option<(String, String)> = if let Some(mid) = reply_to {
-            self.routes
-                .get(&mid)
-                .map(|r| (r.task_id.clone(), r.session_name.clone()))
-        } else if let Some(tid) = &self.active_task {
-            self.find_task(tid)
-                .and_then(|t| t.session_name.map(|s| (t.id.clone(), s)))
-        } else {
-            None
-        };
+        // Resolve the target: a reply to a known question message (so we can annotate it),
+        // else the active-task pointer. Returns (session, message_id-if-routed).
+        let resolved: Option<(String, Option<i64>)> = reply_to
+            .and_then(|mid| {
+                self.routes
+                    .get(&mid)
+                    .map(|r| (r.session_name.clone(), Some(mid)))
+            })
+            .or_else(|| {
+                self.active_task
+                    .as_ref()
+                    .and_then(|tid| self.find_task(tid))
+                    .and_then(|t| t.session_name.map(|s| (s, None)))
+            });
 
-        let Some((_task_id, session)) = target else {
+        let Some((session, route_mid)) = resolved else {
             self.send(
                 chat_id,
                 "Reply to a task's message, or use /answer <id> <text> or /select <id>.",
@@ -486,7 +501,15 @@ impl Bridge {
             return;
         }
         self.inject_text(&session, text);
-        self.send(chat_id, "✅ Sent.");
+        // If this answered a specific question message, annotate it and drop the route;
+        // otherwise just confirm.
+        match route_mid.and_then(|mid| self.routes.remove(&mid).map(|r| (mid, r))) {
+            Some((mid, route)) => {
+                let edited = format!("{}\n\n✅ You answered: {text}", route.text);
+                let _ = self.api.edit_message_text(route.chat_id, mid, &edited);
+            }
+            None => self.send(chat_id, "✅ Sent."),
+        }
     }
 
     fn handle_command(&mut self, chat_id: i64, cmd: Command) {
@@ -690,6 +713,35 @@ impl Bridge {
                 );
             }
             None => self.send(chat_id, "No backlog tasks are ready to start."),
+        }
+    }
+
+    /// Delete Telegram question messages whose underlying pane has changed or whose
+    /// window is gone — i.e. the question was already answered in the terminal (or the
+    /// agent moved on), so the message is stale and shouldn't linger.
+    fn prune_stale_routes(&mut self) {
+        if self.routes.is_empty() {
+            return;
+        }
+        let mut stale: Vec<(i64, i64)> = Vec::new(); // (message_id, chat_id)
+        for (&message_id, route) in &self.routes {
+            let gone = !self
+                .tmux
+                .window_exists(&route.session_name)
+                .unwrap_or(false);
+            let changed = !gone
+                && self
+                    .tmux
+                    .capture_pane(&route.session_name)
+                    .map(|p| hash_pane(&p) != route.pane_hash)
+                    .unwrap_or(false);
+            if gone || changed {
+                stale.push((message_id, route.chat_id));
+            }
+        }
+        for (message_id, chat_id) in stale {
+            let _ = self.api.delete_message(chat_id, message_id);
+            self.routes.remove(&message_id);
         }
     }
 
