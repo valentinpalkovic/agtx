@@ -211,6 +211,28 @@ const SHELL_POPUP_WIDTH: u16 = 128; // Total width including borders
 const SHELL_POPUP_CONTENT_WIDTH: u16 = 126; // Content width (SHELL_POPUP_WIDTH - 2 for borders)
 const SHELL_POPUP_HEIGHT_PERCENT: u16 = 75; // Percentage of terminal height
 
+/// Keep the system awake while agtx runs (macOS only).
+///
+/// Spawns `caffeinate -i -s -w <our-pid>`, which holds a power assertion until agtx's
+/// process exits — so it cleans itself up even if agtx crashes or is killed. Fire-and-forget.
+#[cfg(target_os = "macos")]
+fn start_caffeinate(enabled: bool) {
+    if !enabled {
+        return;
+    }
+    let pid = std::process::id().to_string();
+    let _ = std::process::Command::new("caffeinate")
+        .args(["-i", "-s", "-w", &pid])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// No-op on non-macOS platforms.
+#[cfg(not(target_os = "macos"))]
+fn start_caffeinate(_enabled: bool) {}
+
 /// Application state (separate from terminal for borrow checker)
 struct AppState {
     mode: AppMode,
@@ -904,6 +926,9 @@ impl App {
     pub async fn run(&mut self) -> Result<()> {
         // Start the Telegram bridge once if configured.
         self.maybe_spawn_telegram_bridge();
+
+        // Keep the machine awake (macOS) while agtx is running, if enabled.
+        start_caffeinate(self.state.config.prevent_sleep);
 
         while !self.state.should_quit {
             self.draw()?;

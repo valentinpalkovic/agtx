@@ -28,6 +28,11 @@ pub struct GlobalConfig {
     /// Telegram bridge: notify on idle agent questions and answer/control from your phone
     #[serde(default)]
     pub telegram: TelegramConfig,
+
+    /// On macOS, keep the system awake (via `caffeinate`) while agtx is running so
+    /// long agent sessions don't get suspended when you step away.
+    #[serde(default = "default_true")]
+    pub prevent_sleep: bool,
 }
 
 impl Default for GlobalConfig {
@@ -39,6 +44,7 @@ impl Default for GlobalConfig {
             theme: ThemeConfig::default(),
             fullscreen_on_enter: false,
             telegram: TelegramConfig::default(),
+            prevent_sleep: true,
         }
     }
 }
@@ -437,6 +443,7 @@ pub struct MergedConfig {
     pub fullscreen_on_enter: bool,
     pub branch_prefix: String,
     pub telegram: TelegramConfig,
+    pub prevent_sleep: bool,
 }
 
 impl MergedConfig {
@@ -476,6 +483,7 @@ impl MergedConfig {
                 .clone()
                 .unwrap_or_else(|| global.worktree.branch_prefix.clone()),
             telegram: global.telegram.clone(),
+            prevent_sleep: global.prevent_sleep,
         }
     }
 
