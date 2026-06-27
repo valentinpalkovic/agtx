@@ -63,6 +63,8 @@ struct PendingTransition {
     chat_id: i64,
     label: String,
     deadline: Instant,
+    /// When the transition completes, suggest the next backlog task (used for move_to_done).
+    suggest_next: bool,
 }
 
 /// Spawn the bridge thread. Returns the sender the TUI uses to request outbound checks.
@@ -231,8 +233,16 @@ impl Bridge {
                 kind,
                 options,
             } => (question, kind, options),
-            // Not actually asking — stay silent.
-            Classification::Finished | Classification::Stuck => return,
+            // Work looks done (idle at its prompt, nothing to ask). For phases that need a
+            // human decision, send a completion ping instead of staying silent.
+            Classification::Finished => {
+                if check.phase == "running" || check.phase == "review" {
+                    self.send_completion_ping(&check);
+                }
+                return;
+            }
+            // No input box on screen — mid-thought or crashed. Stay silent.
+            Classification::Stuck => return,
         };
 
         let pane_hash = hash_pane(&pane);
@@ -260,6 +270,47 @@ impl Bridge {
         }
         // Bare replies route to the most recently asked task.
         self.active_task = Some(check.task_id.clone());
+    }
+
+    /// Send a "work looks complete" ping for a Running/Review task awaiting a human
+    /// decision, with the PR link (if any) and a Mark-done / Advance action button.
+    fn send_completion_ping(&mut self, check: &OutboundCheck) {
+        let task = match self.find_task(&check.task_id) {
+            Some(t) => t,
+            None => return,
+        };
+        let short = short_id(&task.id).to_string();
+        let action_label = match task.status {
+            TaskStatus::Review => "✅ Mark done",
+            _ => "⏭ Advance",
+        };
+        let mut text = format!(
+            "✅ #{} · {} · {}\n{}",
+            short,
+            task.status.as_str(),
+            task.agent,
+            task.title
+        );
+        if let Some(url) = task.pr_url.as_deref().filter(|u| !u.is_empty()) {
+            text.push_str(&format!("\nPR: {url}"));
+        }
+        text.push_str("\n\nWork looks complete — your call:");
+        let rows = vec![
+            vec![Button {
+                text: action_label.to_string(),
+                callback_data: cb(&short, "adv", ""),
+            }],
+            vec![Button {
+                text: "📋 Show pane".to_string(),
+                callback_data: cb(&short, "pane", ""),
+            }],
+        ];
+        for &chat_id in &self.allowed_chat_ids {
+            let _ = self
+                .api
+                .send_message(chat_id, &text, None, Some(rows.clone()));
+        }
+        self.active_task = Some(task.id);
     }
 
     // ── Inbound: updates ────────────────────────────────────────────────────
@@ -430,7 +481,7 @@ impl Bridge {
             },
             Command::Resume(short) => match self.find_task(&short) {
                 Some(task) if task.status == TaskStatus::Review => {
-                    self.enqueue_transition(chat_id, &task, "resume", "resuming");
+                    self.enqueue_transition(chat_id, &task, "resume", "resuming", false);
                 }
                 Some(_) => self.send(chat_id, "Only Review tasks can be resumed."),
                 None => self.send(chat_id, &format!("No task matching #{short}")),
@@ -530,10 +581,19 @@ impl Bridge {
             "move_to_done" => "moving to done",
             _ => "advancing",
         };
-        self.enqueue_transition(chat_id, task, action, verb);
+        // After a task is marked done, offer to kickstart the next backlog task.
+        let suggest_next = action == "move_to_done";
+        self.enqueue_transition(chat_id, task, action, verb, suggest_next);
     }
 
-    fn enqueue_transition(&mut self, chat_id: i64, task: &Task, action: &str, verb: &str) {
+    fn enqueue_transition(
+        &mut self,
+        chat_id: i64,
+        task: &Task,
+        action: &str,
+        verb: &str,
+        suggest_next: bool,
+    ) {
         let req = TransitionRequest::new(task.id.clone(), action.to_string());
         let request_id = req.id.clone();
         let short = short_id(&task.id).to_string();
@@ -546,6 +606,7 @@ impl Bridge {
                     chat_id,
                     label,
                     deadline: Instant::now() + Duration::from_secs(90),
+                    suggest_next,
                 });
             }
             Err(e) => self.send(chat_id, &format!("Failed to queue {label}: {e}")),
@@ -562,7 +623,12 @@ impl Bridge {
             match self.db.get_transition_request(&p.request_id) {
                 Ok(Some(req)) if req.processed_at.is_some() => match req.error {
                     Some(err) => self.send(p.chat_id, &format!("❌ {}: {err}", p.label)),
-                    None => self.send(p.chat_id, &format!("✅ {} — done.", p.label)),
+                    None => {
+                        self.send(p.chat_id, &format!("✅ {} — done.", p.label));
+                        if p.suggest_next {
+                            self.suggest_next_task(p.chat_id);
+                        }
+                    }
                 },
                 _ => {
                     if Instant::now() >= p.deadline {
@@ -580,6 +646,30 @@ impl Bridge {
             }
         }
         self.pending = still;
+    }
+
+    /// Suggest the next dependency-satisfied backlog task with a one-tap Start button.
+    fn suggest_next_task(&self, chat_id: i64) {
+        let tasks = self.db.get_all_tasks().unwrap_or_default();
+        let next = tasks
+            .iter()
+            .find(|t| t.status == TaskStatus::Backlog && self.db.deps_satisfied(t));
+        match next {
+            Some(t) => {
+                let short = short_id(&t.id).to_string();
+                let kb = vec![vec![Button {
+                    text: "▶️ Start".to_string(),
+                    callback_data: cb(&short, "adv", ""),
+                }]];
+                let _ = self.api.send_message(
+                    chat_id,
+                    &format!("Next up: #{short} {}", t.title),
+                    None,
+                    Some(kb),
+                );
+            }
+            None => self.send(chat_id, "No backlog tasks are ready to start."),
+        }
     }
 
     // ── Injection helpers ───────────────────────────────────────────────────
