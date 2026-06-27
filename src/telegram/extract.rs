@@ -56,7 +56,9 @@ pub struct ExtractedOption {
 pub enum Classification {
     /// The agent is waiting for an answer.
     Asking {
-        question: String,
+        /// Human-readable context to show the user: the agent's recent reasoning, the
+        /// question, and any options — cleaned of ANSI and the input-box chrome.
+        context: String,
         kind: QuestionKind,
         options: Vec<ExtractedOption>,
     },
@@ -383,17 +385,17 @@ pub fn classify(pane: &str, _agent: &str) -> Classification {
     match options {
         Some((kind, opts)) => {
             // An interactive menu / yes-no is a strong signal — notify regardless of box.
-            let question = extract_question_text(&block, &opts);
-            let question = if question.is_empty() {
+            let context = build_context(&block);
+            let context = if context.is_empty() {
                 match kind {
                     QuestionKind::YesNo => "Confirm? (yes/no)".to_string(),
                     _ => "Choose an option:".to_string(),
                 }
             } else {
-                question
+                context
             };
             Classification::Asking {
-                question,
+                context,
                 kind,
                 options: opts,
             }
@@ -405,8 +407,14 @@ pub fn classify(pane: &str, _agent: &str) -> Classification {
             }
             let question = extract_question_text(&block, &[]);
             if !question.is_empty() && looks_like_question(&question) {
+                let context = build_context(&block);
+                let context = if context.is_empty() {
+                    question
+                } else {
+                    context
+                };
                 Classification::Asking {
-                    question,
+                    context,
                     kind: QuestionKind::FreeText,
                     options: Vec::new(),
                 }
@@ -415,6 +423,29 @@ pub fn classify(pane: &str, _agent: &str) -> Classification {
             }
         }
     }
+}
+
+/// Build a readable context excerpt from the question block (reasoning + question +
+/// options), limited to the last ~25 lines and ~1500 chars so it stays phone-friendly.
+/// The question sits at the bottom of the block, so we keep the tail.
+fn build_context(block: &[&str]) -> String {
+    let mut end = block.len();
+    while end > 0 && block[end - 1].trim().is_empty() {
+        end -= 1;
+    }
+    let slice = &block[..end];
+    let start = slice.len().saturating_sub(25);
+    let text = slice[start..].join("\n");
+    truncate_tail(text.trim(), 1500)
+}
+
+/// Keep at most the last `max` characters (UTF-8 safe), prefixing `…` if truncated.
+fn truncate_tail(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        return s.to_string();
+    }
+    format!("…{}", s.chars().skip(count - max).collect::<String>())
 }
 
 #[cfg(test)]
@@ -450,7 +481,7 @@ Do you want to make this edit to config.rs?
 ";
         match classify(pane, "claude") {
             Classification::Asking {
-                question,
+                context,
                 kind,
                 options,
             } => {
@@ -458,7 +489,9 @@ Do you want to make this edit to config.rs?
                 assert_eq!(options.len(), 3);
                 assert_eq!(options[0].key, "1");
                 assert!(options[0].label.starts_with("Yes"));
-                assert!(question.contains("Do you want to make this edit"));
+                // Context keeps the question AND the full option text (not just buttons).
+                assert!(context.contains("Do you want to make this edit"));
+                assert!(context.contains("don't ask again"));
             }
             other => panic!("expected Asking, got {other:?}"),
         }
@@ -498,9 +531,9 @@ Which authentication provider config format should I target?
 Type your message
 ";
         match classify(pane, "gemini") {
-            Classification::Asking { kind, question, .. } => {
+            Classification::Asking { kind, context, .. } => {
                 assert_eq!(kind, QuestionKind::FreeText);
-                assert!(question.contains("authentication provider"));
+                assert!(context.contains("authentication provider"));
             }
             other => panic!("expected Asking, got {other:?}"),
         }

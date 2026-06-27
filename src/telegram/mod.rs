@@ -247,12 +247,12 @@ impl Bridge {
             Ok(p) => p,
             Err(_) => return,
         };
-        let (question, kind, options) = match classify(&pane, &check.agent) {
+        let (context, kind, options) = match classify(&pane, &check.agent) {
             Classification::Asking {
-                question,
+                context,
                 kind,
                 options,
-            } => (question, kind, options),
+            } => (context, kind, options),
             // Work looks done (idle at its prompt, nothing to ask). For phases that need a
             // human decision, send a completion ping instead of staying silent.
             Classification::Finished => {
@@ -267,7 +267,7 @@ impl Bridge {
 
         let pane_hash = hash_pane(&pane);
         let short = short_id(&check.task_id).to_string();
-        let text = format_question(&check, &question, &kind);
+        let text = format_question(&check, &context, &kind);
         let keyboard = build_keyboard(&short, &kind, &options);
 
         for &chat_id in &self.allowed_chat_ids {
@@ -799,17 +799,18 @@ fn task_title(db: &Database, short: &str) -> String {
         .unwrap_or_default()
 }
 
-fn format_question(check: &OutboundCheck, question: &str, kind: &QuestionKind) -> String {
+fn format_question(check: &OutboundCheck, context: &str, kind: &QuestionKind) -> String {
     let mut text = format!(
-        "🟡 #{} · {} · {}\n{}\n\nQ: {}",
+        "🟡 #{} · {} · {}\n{}\n\n{}",
         short_id(&check.task_id),
         check.phase,
         check.agent,
         check.title,
-        question
+        context
     );
-    if *kind == QuestionKind::FreeText {
-        text.push_str("\n\n(reply to this message to answer)");
+    match kind {
+        QuestionKind::FreeText => text.push_str("\n\n💬 Reply to this message to answer."),
+        _ => text.push_str("\n\n👇 Tap an option below."),
     }
     text
 }
@@ -916,7 +917,8 @@ mod tests {
             agent: "claude".to_string(),
         };
         let text = format_question(&check, "Which format?", &QuestionKind::FreeText);
-        assert!(text.contains("reply to this message"));
+        assert!(text.contains("Reply to this message"));
+        assert!(text.contains("Which format?"));
         assert!(text.contains("#a1b2c3d4"));
     }
 }
