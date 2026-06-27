@@ -256,7 +256,7 @@ impl Bridge {
             // Work looks done (idle at its prompt, nothing to ask). For phases that need a
             // human decision, send a completion ping instead of staying silent.
             Classification::Finished => {
-                if check.phase == "running" || check.phase == "review" {
+                if matches!(check.phase.as_str(), "running" | "review" | "research") {
                     self.send_completion_ping(&check);
                 }
                 return;

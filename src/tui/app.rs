@@ -7143,10 +7143,13 @@ impl App {
             // so it isn't bound by the MCP send_to_task Planning/Running restriction). The
             // bridge thread decides whether the agent is actually asking; we just signal idle.
             if let Some(tx) = &self.state.telegram_tx {
+                // Eligible phases: Planning/Running/Review, plus a Backlog task with a
+                // live session (that's the research phase — same set the refresh polls).
                 let eligible = matches!(
                     task_status.status,
                     TaskStatus::Planning | TaskStatus::Running | TaskStatus::Review
-                );
+                ) || (task_status.status == TaskStatus::Backlog
+                    && task_status.session_name.is_some());
                 if eligible
                     && phase == PhaseStatus::Idle
                     && !self
@@ -7166,11 +7169,18 @@ impl App {
                             .find(|t| t.id == task_status.task_id)
                             .map(|t| t.title.clone())
                             .unwrap_or_else(|| "task".to_string());
+                        // Show "research" rather than "backlog" for a Backlog task with
+                        // a session, matching agtx's own phase labeling.
+                        let phase_label = if task_status.status == TaskStatus::Backlog {
+                            "research".to_string()
+                        } else {
+                            task_status.status.as_str().to_string()
+                        };
                         let _ = tx.send(crate::telegram::OutboundCheck {
                             task_id: task_status.task_id.clone(),
                             session_name: sn.clone(),
                             title,
-                            phase: task_status.status.as_str().to_string(),
+                            phase: phase_label,
                             agent: task_status.agent.clone(),
                         });
                     }
