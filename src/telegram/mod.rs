@@ -104,6 +104,10 @@ struct Bridge {
     active_task: Option<String>,
     pending: Vec<PendingTransition>,
     offset: i64,
+    /// Reconstructed orchestrator tmux target ("{session}:orchestrator").
+    orch_target: String,
+    /// Deferred capture of the orchestrator pane after a chat message: (chat_id, when).
+    pending_orch_capture: Option<(i64, Instant)>,
 }
 
 fn run_bridge(
@@ -125,6 +129,12 @@ fn run_bridge(
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "project".to_string());
+    // The orchestrator runs as window "orchestrator" in the project's tmux session.
+    // The session name is the same safe-slug the TUI computes from the project name.
+    let orch_target = format!(
+        "{}:orchestrator",
+        crate::tmux::safe_session_name(&project_name)
+    );
 
     let mut bridge = Bridge {
         api: TelegramApi::new(token, poll_timeout_secs),
@@ -138,6 +148,8 @@ fn run_bridge(
         active_task: None,
         pending: Vec::new(),
         offset: 0,
+        orch_target,
+        pending_orch_capture: None,
     };
 
     // Discard any updates that arrived before startup so we don't replay stale commands.
@@ -187,6 +199,14 @@ fn run_bridge(
 
         // 3. Report on any completed transitions.
         bridge.check_pending();
+
+        // 4. Deferred orchestrator pane capture after a chat message (non-blocking).
+        if let Some((chat_id, when)) = bridge.pending_orch_capture {
+            if Instant::now() >= when {
+                bridge.pending_orch_capture = None;
+                bridge.send_orch_pane(chat_id);
+            }
+        }
     }
 }
 
@@ -511,6 +531,7 @@ impl Bridge {
                 },
                 None => self.send(chat_id, &format!("No task matching #{id}")),
             },
+            Command::Orchestrator(msg) => self.handle_orchestrator(chat_id, &msg),
             Command::Help => self.send(chat_id, &help_text()),
             Command::Unknown(c) => self.send(chat_id, &format!("Unknown command: /{c}\nTry /help")),
         }
@@ -712,6 +733,59 @@ impl Bridge {
         let text = format!("📋 #{}\n\n{}", short_id(&task.id), excerpt);
         let _ = self.api.send_message(chat_id, &text, reply_to, None);
     }
+
+    /// View the orchestrator's conversation, or send it a message and report back shortly.
+    fn handle_orchestrator(&mut self, chat_id: i64, msg: &str) {
+        if !self.tmux.window_exists(&self.orch_target).unwrap_or(false) {
+            self.send(
+                chat_id,
+                "Orchestrator isn't running. Toggle it with O in agtx (needs --experimental).",
+            );
+            return;
+        }
+        let msg = msg.trim();
+        if msg.is_empty() {
+            // No message — just show the conversation.
+            self.send_orch_pane(chat_id);
+            return;
+        }
+        // Send the message into the orchestrator pane, then capture its reply a few
+        // seconds later (deferred so the bridge loop isn't blocked).
+        let _ = self.tmux.send_keys(&self.orch_target, msg);
+        self.send(chat_id, "📨 Sent to the orchestrator.");
+        self.pending_orch_capture = Some((chat_id, Instant::now() + Duration::from_secs(4)));
+    }
+
+    /// Send the orchestrator's recent pane content (its conversation) to Telegram.
+    fn send_orch_pane(&self, chat_id: i64) {
+        let content = match self.tmux.capture_pane(&self.orch_target) {
+            Ok(c) => c,
+            Err(_) => {
+                self.send(chat_id, "Couldn't read the orchestrator pane.");
+                return;
+            }
+        };
+        let clean = extract::strip_ansi(&content);
+        let lines: Vec<&str> = clean.lines().collect();
+        let start = lines.len().saturating_sub(40);
+        let body = tail_chars(lines[start..].join("\n").trim(), 3500);
+        let text = if body.is_empty() {
+            "🧭 Orchestrator (no visible output yet)".to_string()
+        } else {
+            format!("🧭 Orchestrator:\n\n{body}")
+        };
+        self.send(chat_id, &text);
+    }
+}
+
+/// Keep at most the last `n` characters of `s` (UTF-8 safe), prefixing `…` if truncated.
+fn tail_chars(s: &str, n: usize) -> String {
+    let count = s.chars().count();
+    if count <= n {
+        return s.to_string();
+    }
+    let skip = count - n;
+    format!("…{}", s.chars().skip(skip).collect::<String>())
 }
 
 fn task_title(db: &Database, short: &str) -> String {

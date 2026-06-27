@@ -17,6 +17,8 @@ pub enum Command {
     Answer { id: String, text: String },
     /// Set the active task for bare replies.
     Select(String),
+    /// View the orchestrator's conversation (empty arg) or send it a message.
+    Orchestrator(String),
     /// Show help.
     Help,
     /// Unrecognized command.
@@ -40,6 +42,7 @@ pub fn parse_command(text: &str) -> Command {
         "resume" => Command::Resume(first_token(rest).to_string()),
         "new" | "create" => Command::New(rest.to_string()),
         "select" | "sel" => Command::Select(first_token(rest).to_string()),
+        "orch" | "orchestrator" => Command::Orchestrator(rest.to_string()),
         "answer" | "reply" => {
             let id = first_token(rest).to_string();
             let body = rest
@@ -146,6 +149,7 @@ agtx Telegram bridge — commands:
 /new <title> — create a backlog task
 /answer <id> <text> — answer a specific task
 /select <id> — set the active task for bare replies
+/orch [message] — view the orchestrator's chat, or send it a message
 /help — this message
 
 You can also just reply to a task's notification to answer it, or tap the buttons."
@@ -189,6 +193,19 @@ mod tests {
     #[test]
     fn parses_botname_suffix() {
         assert_eq!(parse_command("/board@agtx_bot"), Command::Board);
+    }
+
+    #[test]
+    fn parses_orchestrator() {
+        assert_eq!(parse_command("/orch"), Command::Orchestrator(String::new()));
+        assert_eq!(
+            parse_command("/orch what's the status?"),
+            Command::Orchestrator("what's the status?".to_string())
+        );
+        assert_eq!(
+            parse_command("/orchestrator hello"),
+            Command::Orchestrator("hello".to_string())
+        );
     }
 
     #[test]
