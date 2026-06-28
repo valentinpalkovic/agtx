@@ -195,12 +195,13 @@ fn contains_input_marker(line: &str) -> bool {
 /// Strip the agent's input-box chrome from the bottom of the captured lines, returning the
 /// "question block" above it. We cut from the lowest input marker line downward.
 fn strip_input_box<'a>(lines: &[&'a str]) -> Vec<&'a str> {
-    // Find the lowest line index that looks like input-box chrome (marker or border line
-    // among the bottom region). Cut everything from there down.
+    // The input widget is always at the very bottom, so cut at the BOTTOMMOST input-box
+    // marker (not the topmost). This stays correct when the capture includes scrollback,
+    // where old prompts/banners can leave earlier marker lines further up.
     let mut cut = lines.len();
     for (idx, line) in lines.iter().enumerate() {
         if contains_input_marker(line) {
-            cut = cut.min(idx);
+            cut = idx;
         }
     }
     if cut == lines.len() {
@@ -432,6 +433,51 @@ fn build_context(block: &[&str]) -> String {
     clean_lines_limited(block.iter().copied(), 25, 1500)
 }
 
+/// Extract the agent's full latest message, delimited by Claude Code's message marker
+/// (the "big dot" `⏺` that prefixes each assistant turn): everything from the LAST marker
+/// down to the input box. This captures the whole message regardless of length, instead of
+/// a fixed line window. Returns None when there's no marker (e.g. other agents), so callers
+/// can fall back to the line-window heuristic.
+pub fn extract_marked_message(pane: &str, max_lines: usize, max_chars: usize) -> Option<String> {
+    let clean = strip_ansi(pane);
+    let lines: Vec<&str> = clean.lines().collect();
+    let block = strip_input_box(&lines);
+    let marker_idx = block.iter().rposition(|l| starts_with_marker(l))?;
+    let msg: Vec<String> = block[marker_idx..]
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            if i == 0 {
+                strip_leading_marker(line)
+            } else {
+                (*line).to_string()
+            }
+        })
+        .collect();
+    Some(clean_lines_limited(
+        msg.iter().map(|s| s.as_str()),
+        max_lines,
+        max_chars,
+    ))
+}
+
+/// True if the line (ignoring leading whitespace) begins with Claude's message dot.
+fn starts_with_marker(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with('⏺') || t.starts_with('●') || t.starts_with('⬤')
+}
+
+/// Strip a leading message-dot marker (and following space) from a line.
+fn strip_leading_marker(line: &str) -> String {
+    let t = line.trim_start();
+    let t = t
+        .strip_prefix('⏺')
+        .or_else(|| t.strip_prefix('●'))
+        .or_else(|| t.strip_prefix('⬤'))
+        .unwrap_or(t);
+    t.trim_start().to_string()
+}
+
 /// Clean raw pane text for phone display, then keep the last `max_lines` / `max_chars`.
 ///
 /// Strips ANSI and box-drawing/indentation noise and collapses whitespace *before*
@@ -591,6 +637,38 @@ mod tests {
         assert!(out.lines().all(|l| l == l.trim_start()));
         // No double spaces left.
         assert!(!out.contains("  "));
+    }
+
+    #[test]
+    fn extracts_full_message_from_last_dot() {
+        let pane = "\
+⏺ An earlier message we don't want.
+
+⏺ Here is my final message.
+  It can span several lines,
+  and we want all of them.
+
+  Should I proceed?
+
+╭────────────────────────────╮
+│ >                          │
+╰────────────────────────────╯
+  ? for shortcuts";
+        let out = extract_marked_message(pane, 100, 2000).unwrap();
+        assert!(out.contains("Here is my final message."));
+        assert!(out.contains("span several lines"));
+        assert!(out.contains("Should I proceed?"));
+        // Only the last ⏺ block, marker stripped, no input-box chrome.
+        assert!(!out.contains("earlier message"));
+        assert!(!out.contains('⏺'));
+        assert!(!out.contains('│'));
+        assert!(!out.contains("? for shortcuts"));
+    }
+
+    #[test]
+    fn marked_message_none_without_dot() {
+        let pane = "plain output\nno markers here\nType your message";
+        assert!(extract_marked_message(pane, 100, 2000).is_none());
     }
 
     #[test]

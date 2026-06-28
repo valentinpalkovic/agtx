@@ -273,7 +273,17 @@ impl Bridge {
 
         let pane_hash = hash_pane(&pane);
         let short = short_id(&check.task_id).to_string();
-        let text = format_question(&check, &context, &kind);
+        // Prefer the full last message delimited by Claude's "big dot" marker, pulled from
+        // scrollback so long messages aren't cut. Fall back to the visible-window context
+        // (e.g. for agents that don't print the marker).
+        let history = String::from_utf8_lossy(
+            &self
+                .tmux
+                .capture_pane_with_history(&check.session_name, 500),
+        )
+        .to_string();
+        let body = extract::extract_marked_message(&history, 200, 3800).unwrap_or(context);
+        let text = format_question(&check, &body, &kind);
         let keyboard = build_keyboard(&short, &kind, &options);
 
         for &chat_id in &self.allowed_chat_ids {
