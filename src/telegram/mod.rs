@@ -779,9 +779,7 @@ impl Bridge {
             return;
         };
         let content = self.tmux.capture_pane(session).unwrap_or_default();
-        let clean = extract::strip_ansi(&content);
-        let tail: Vec<&str> = clean.lines().rev().take(30).collect();
-        let excerpt: String = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
+        let excerpt = extract::clean_pane(&content, 30, 3500);
         let text = format!("📋 #{}\n\n{}", short_id(&task.id), excerpt);
         let _ = self.api.send_message(chat_id, &text, reply_to, None);
     }
@@ -817,10 +815,7 @@ impl Bridge {
                 return;
             }
         };
-        let clean = extract::strip_ansi(&content);
-        let lines: Vec<&str> = clean.lines().collect();
-        let start = lines.len().saturating_sub(40);
-        let body = tail_chars(lines[start..].join("\n").trim(), 3500);
+        let body = extract::clean_pane(&content, 40, 3500);
         let text = if body.is_empty() {
             "🧭 Orchestrator (no visible output yet)".to_string()
         } else {
@@ -828,16 +823,6 @@ impl Bridge {
         };
         self.send(chat_id, &text);
     }
-}
-
-/// Keep at most the last `n` characters of `s` (UTF-8 safe), prefixing `…` if truncated.
-fn tail_chars(s: &str, n: usize) -> String {
-    let count = s.chars().count();
-    if count <= n {
-        return s.to_string();
-    }
-    let skip = count - n;
-    format!("…{}", s.chars().skip(skip).collect::<String>())
 }
 
 fn task_title(db: &Database, short: &str) -> String {

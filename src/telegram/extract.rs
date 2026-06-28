@@ -429,14 +429,130 @@ pub fn classify(pane: &str, _agent: &str) -> Classification {
 /// options), limited to the last ~25 lines and ~1500 chars so it stays phone-friendly.
 /// The question sits at the bottom of the block, so we keep the tail.
 fn build_context(block: &[&str]) -> String {
-    let mut end = block.len();
-    while end > 0 && block[end - 1].trim().is_empty() {
-        end -= 1;
+    clean_lines_limited(block.iter().copied(), 25, 1500)
+}
+
+/// Clean raw pane text for phone display, then keep the last `max_lines` / `max_chars`.
+///
+/// Strips ANSI and box-drawing/indentation noise and collapses whitespace *before*
+/// applying the limits, so the message you receive isn't dominated by the agent TUI's
+/// borders, padding, and deep indentation.
+pub fn clean_pane(raw: &str, max_lines: usize, max_chars: usize) -> String {
+    let stripped = strip_ansi(raw);
+    clean_lines_limited(stripped.lines(), max_lines, max_chars)
+}
+
+/// Clean each line (strip box chars + collapse whitespace), drop empty lines down to a
+/// single blank between paragraphs, then keep the last `max_lines` and cap at `max_chars`.
+fn clean_lines_limited<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    max_lines: usize,
+    max_chars: usize,
+) -> String {
+    let mut cleaned: Vec<String> = Vec::new();
+    let mut prev_blank = true; // suppress leading blank lines
+    for line in lines {
+        let c = clean_line(line);
+        if c.is_empty() {
+            if !prev_blank {
+                cleaned.push(String::new()); // collapse runs of blanks to one
+                prev_blank = true;
+            }
+        } else {
+            cleaned.push(c);
+            prev_blank = false;
+        }
     }
-    let slice = &block[..end];
-    let start = slice.len().saturating_sub(25);
-    let text = slice[start..].join("\n");
-    truncate_tail(text.trim(), 1500)
+    while matches!(cleaned.last(), Some(l) if l.is_empty()) {
+        cleaned.pop();
+    }
+    let start = cleaned.len().saturating_sub(max_lines);
+    truncate_tail(cleaned[start..].join("\n").trim(), max_chars)
+}
+
+/// Replace box-drawing / decorative chars with spaces and collapse whitespace runs.
+fn clean_line(line: &str) -> String {
+    let replaced: String = line
+        .chars()
+        .map(|c| if is_box_char(c) { ' ' } else { c })
+        .collect();
+    collapse_ws(&replaced)
+}
+
+/// Collapse every run of whitespace into a single space and trim the ends. This kills the
+/// agent TUI's heavy indentation and column padding that reads as huge gaps on a phone.
+fn collapse_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(ch);
+            prev_space = false;
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Box-drawing, table, and cursor/bullet decoration characters (incl. the ASCII pipe `|`).
+fn is_box_char(c: char) -> bool {
+    matches!(
+        c,
+        '│' | '─'
+            | '╭'
+            | '╮'
+            | '╰'
+            | '╯'
+            | '┌'
+            | '┐'
+            | '└'
+            | '┘'
+            | '├'
+            | '┤'
+            | '┬'
+            | '┴'
+            | '┼'
+            | '|'
+            | '╔'
+            | '╗'
+            | '╚'
+            | '╝'
+            | '═'
+            | '║'
+            | '╠'
+            | '╣'
+            | '╦'
+            | '╩'
+            | '╬'
+            | '┃'
+            | '━'
+            | '┏'
+            | '┓'
+            | '┗'
+            | '┛'
+            | '┣'
+            | '┫'
+            | '┳'
+            | '┻'
+            | '╋'
+            | '▌'
+            | '▐'
+            | '▎'
+            | '▏'
+            | '▕'
+            | '░'
+            | '▒'
+            | '▓'
+            | '█'
+            | '❯'
+            | '▶'
+            | '➤'
+            | '»'
+    )
 }
 
 /// Keep at most the last `max` characters (UTF-8 safe), prefixing `…` if truncated.
@@ -451,6 +567,38 @@ fn truncate_tail(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clean_pane_strips_box_pipes_and_indentation() {
+        let raw = "\
+╭────────────────────────────╮
+│  Do you want to proceed?    │
+│                             │
+│  | piped | text |           │
+╰────────────────────────────╯
+            deeply indented line";
+        let out = clean_pane(raw, 50, 1000);
+        // No box-drawing or pipe characters survive.
+        assert!(!out.contains('│'));
+        assert!(!out.contains('|'));
+        assert!(!out.contains('╭'));
+        assert!(!out.contains('╰'));
+        // Content is preserved, whitespace collapsed.
+        assert!(out.contains("Do you want to proceed?"));
+        assert!(out.contains("piped text"));
+        assert!(out.contains("deeply indented line"));
+        // No line starts with whitespace (indentation killed).
+        assert!(out.lines().all(|l| l == l.trim_start()));
+        // No double spaces left.
+        assert!(!out.contains("  "));
+    }
+
+    #[test]
+    fn clean_pane_collapses_blank_runs() {
+        let raw = "line one\n\n\n\nline two";
+        let out = clean_pane(raw, 50, 1000);
+        assert_eq!(out, "line one\n\nline two");
+    }
 
     #[test]
     fn strips_ansi_csi_and_osc() {
