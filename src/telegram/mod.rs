@@ -10,7 +10,10 @@
 
 pub mod api;
 pub mod commands;
+pub mod daemon;
 pub mod extract;
+
+pub use daemon::serve_daemon;
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};

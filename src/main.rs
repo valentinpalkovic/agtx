@@ -63,6 +63,10 @@ async fn main() -> Result<()> {
             };
             return agtx::mcp::serve(project_path).await;
         }
+        Some("telegram-serve") => {
+            // Standalone multi-project Telegram daemon (single bot, all projects).
+            return agtx::telegram::serve_daemon();
+        }
         Some("trust") => {
             let project_path = std::env::current_dir()?.canonicalize()?;
             let mut store = config::TrustStore::load().unwrap_or_default();
