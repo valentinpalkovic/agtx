@@ -447,3 +447,10 @@ Detected automatically via `known_agents()` in order of preference:
 - Orchestrator: support non-Claude agents as orchestrator
 - Orchestrator: task deletion notifications
 - Orchestrator: multi-project support (see `docs/planning/multi-project-orchestrator.md`)
+
+## Development Workflow Notes
+
+- After merging or switching branches to manually test a local change, rebuild and re-symlink the binary by default, without waiting to be asked (see the `build-and-symlink` skill).
+  Rationale: this exact build-then-symlink request was retyped from scratch 8 times across sessions because the installed test binary goes stale after every branch switch.
+- Before declaring a Telegram bridge change (`src/telegram/*.rs`) done, trigger a real notification and inspect the actual rendered message in Telegram - completeness, stripped formatting, and the answer/delete flow (see the `telegram-bridge-verify` skill).
+  Rationale: message-capture and formatting defects (missing context, a stale/invisible answer, raw box-drawing characters, incomplete capture) were each only caught one at a time across four separate rounds of real usage over two days.
